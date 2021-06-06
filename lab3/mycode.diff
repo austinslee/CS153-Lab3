@@ -1,0 +1,212 @@
+diff --git a/Makefile b/Makefile
+index 2d2b9e4..8402a08 100644
+--- a/Makefile
++++ b/Makefile
+@@ -177,6 +177,8 @@ UPROGS=\
+ 	_zombie\
+ 	_shm_cnt\
+ 	_null\
++	_extra_test3\
++	_test3\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/defs.h b/defs.h
+index 889539b..e4ec5d4 100644
+--- a/defs.h
++++ b/defs.h
+@@ -180,7 +180,7 @@ int             deallocuvm(pde_t*, uint, uint);
+ void            freevm(pde_t*);
+ void            inituvm(pde_t*, char*, uint);
+ int             loaduvm(pde_t*, char*, struct inode*, uint, uint);
+-pde_t*          copyuvm(pde_t*, uint);
++pde_t*          copyuvm(pde_t*, uint, uint);
+ void            switchuvm(struct proc*);
+ void            switchkvm(void);
+ int             copyout(pde_t*, uint, void*, uint);
+diff --git a/exec.c b/exec.c
+index b40134f..b22809d 100644
+--- a/exec.c
++++ b/exec.c
+@@ -13,6 +13,7 @@ exec(char *path, char **argv)
+   char *s, *last;
+   int i, off;
+   uint argc, sz, sp, ustack[3+MAXARG+1];
++  uint szStack;
+   struct elfhdr elf;
+   struct inode *ip;
+   struct proghdr ph;
+@@ -62,11 +63,26 @@ exec(char *path, char **argv)
+ 
+   // Allocate two pages at the next page boundary.
+   // Make the first inaccessible.  Use the second as the user stack.
++  /*
+   sz = PGROUNDUP(sz);
+-  if((sz = allocuvm(pgdir, sz, sz + 2*PGSIZE)) == 0)
++
++  if((sz = allocuvm(pgdir, (KERNBASE - 1) - (2*PGSIZE), (KERNBASE - 1))) == 0)
++    goto bad;
++  sp = KERNBASE - 1;
++  szStack = 1;
++*/
++
++  sz = PGROUNDUP(sz);
++  sp = KERNBASE-1;
++  if((allocuvm(pgdir, sp - 2*PGSIZE, sp)) == 0)
+     goto bad;
+-  clearpteu(pgdir, (char*)(sz - 2*PGSIZE));
+-  sp = sz;
++  
++  szStack = 1;
++
++
++
++  //clearpteu(pgdir, (char*)(sz - 2*PGSIZE));
++  //sp = sz;
+ 
+   // Push argument strings, prepare rest of stack in ustack.
+   for(argc = 0; argv[argc]; argc++) {
+@@ -97,6 +113,7 @@ exec(char *path, char **argv)
+   oldpgdir = curproc->pgdir;
+   curproc->pgdir = pgdir;
+   curproc->sz = sz;
++  curproc->szStack = szStack;
+   curproc->tf->eip = elf.entry;  // main
+   curproc->tf->esp = sp;
+   switchuvm(curproc);
+diff --git a/proc.c b/proc.c
+index 806b1b1..c7f3138 100644
+--- a/proc.c
++++ b/proc.c
+@@ -190,7 +190,7 @@ fork(void)
+   }
+ 
+   // Copy process state from proc.
+-  if((np->pgdir = copyuvm(curproc->pgdir, curproc->sz)) == 0){
++  if((np->pgdir = copyuvm(curproc->pgdir, curproc->sz, curproc->szStack)) == 0){
+     kfree(np->kstack);
+     np->kstack = 0;
+     np->state = UNUSED;
+diff --git a/proc.h b/proc.h
+index 1647114..b98ce39 100644
+--- a/proc.h
++++ b/proc.h
+@@ -37,6 +37,7 @@ enum procstate { UNUSED, EMBRYO, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ // Per-process state
+ struct proc {
+   uint sz;                     // Size of process memory (bytes)
++  uint szStack;
+   pde_t* pgdir;                // Page table
+   char *kstack;                // Bottom of kernel stack for this process
+   enum procstate state;        // Process state
+diff --git a/syscall.c b/syscall.c
+index 94ef3c9..c819ee0 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -17,9 +17,9 @@
+ int
+ fetchint(uint addr, int *ip)
+ {
+-  struct proc *curproc = myproc();
++  //struct proc *curproc = myproc();
+ 
+-  if(addr >= curproc->sz || addr+4 > curproc->sz)
++  if(addr >= (KERNBASE - 1) || addr+4 > (KERNBASE-1))
+     return -1;
+   *ip = *(int*)(addr);
+   return 0;
+@@ -32,12 +32,12 @@ int
+ fetchstr(uint addr, char **pp)
+ {
+   char *s, *ep;
+-  struct proc *curproc = myproc();
++  //struct proc *curproc = myproc();
+ 
+-  if(addr >= curproc->sz)
++  if(addr >= KERNBASE - 1)
+     return -1;
+   *pp = (char*)addr;
+-  ep = (char*)curproc->sz;
++  ep = (char*)(KERNBASE - 1);
+   for(s = *pp; s < ep; s++){
+     if(*s == 0)
+       return s - *pp;
+@@ -59,11 +59,11 @@ int
+ argptr(int n, char **pp, int size)
+ {
+   int i;
+-  struct proc *curproc = myproc();
++  //struct proc *curproc = myproc();
+  
+   if(argint(n, &i) < 0)
+     return -1;
+-  if(size < 0 || (uint)i >= curproc->sz || (uint)i+size > curproc->sz)
++  if(size < 0 || (uint)i >= (KERNBASE - 1) || (uint)i+size > (KERNBASE - 1))
+     return -1;
+   *pp = (char*)i;
+   return 0;
+diff --git a/trap.c b/trap.c
+index 41c66eb..60368b0 100644
+--- a/trap.c
++++ b/trap.c
+@@ -77,6 +77,17 @@ trap(struct trapframe *tf)
+             cpuid(), tf->cs, tf->eip);
+     lapiceoi();
+     break;
++  case T_PGFLT: ;
++	uint address = rcr2();
++	if (address > KERNBASE - 1) {
++		cprintf("T_PGFLT Kernel panic!\n");
++		exit();
++	}
++	address = PGROUNDDOWN(address);
++	allocuvm(myproc() -> pgdir, address, address + PGSIZE);
++	cprintf("Increased stack size\n");
++	myproc() -> szStack++;
++	break;
+ 
+   //PAGEBREAK: 13
+   default:
+diff --git a/vm.c b/vm.c
+index f623aa3..76d7046 100644
+--- a/vm.c
++++ b/vm.c
+@@ -313,7 +313,7 @@ clearpteu(pde_t *pgdir, char *uva)
+ // Given a parent process's page table, create a copy
+ // of it for a child.
+ pde_t*
+-copyuvm(pde_t *pgdir, uint sz)
++copyuvm(pde_t *pgdir,uint sz, uint szStack)
+ {
+   pde_t *d;
+   pte_t *pte;
+@@ -335,6 +335,29 @@ copyuvm(pde_t *pgdir, uint sz)
+     if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0)
+       goto bad;
+   }
++
++
++  uint t = KERNBASE-1;
++  t = PGROUNDDOWN(t);
++  
++  for(i = t; i > t - (myproc()->szStack) * PGSIZE; i -= PGSIZE){
++
++    if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
++      panic("copyuvm: pte should exist");
++    if(!(*pte & PTE_P))
++      panic("copyuvm: page not present");
++    pa = PTE_ADDR(*pte);
++    flags = PTE_FLAGS(*pte);
++    if((mem = kalloc()) == 0)
++      goto bad;
++    memmove(mem, (char*)P2V(pa), PGSIZE);
++    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0)
++      goto bad;
++
++	}
++
++
++
+   return d;
+ 
+ bad:
